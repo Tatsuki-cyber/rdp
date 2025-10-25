@@ -1,17 +1,18 @@
-name: Tailscale Persistent Node
+name: Persistent Tailscale Node
 
 on:
   workflow_dispatch:
 
 jobs:
   tailscale-node:
-    runs-on: ubuntu-latest
-    timeout-minutes: 60
+    runs-on: self-hosted  # Use your self-hosted runner
+    timeout-minutes: 4320 # Up to 72 hours
 
     steps:
-      - name: Update & Install Dependencies
+      - name: Update System
         run: |
           sudo apt-get update -y
+          sudo apt-get upgrade -y
           sudo apt-get install -y curl ufw
 
       - name: Install Tailscale
@@ -27,7 +28,7 @@ jobs:
           HOSTNAME="gh-node-$GITHUB_RUN_ID"
           sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=$HOSTNAME
 
-          # Wait for IP assignment
+          # Wait a few seconds for IP assignment
           sleep 5
           TS_IP=$(tailscale ip -4)
           if [ -z "$TS_IP" ]; then
@@ -41,4 +42,11 @@ jobs:
           echo "=== Tailscale Node Active ==="
           echo "Tailscale IP: $TAILSCALE_IP"
           echo "Hostname: gh-node-$GITHUB_RUN_ID"
-          echo "This node is persistent but does NOT act as an exit node."
+          echo "This node stays connected to the tailnet but does NOT route internet traffic."
+      
+      - name: Keep Runner Alive
+        run: |
+          echo "Runner is alive. Press Ctrl+C to stop..."
+          while true; do
+            sleep 300
+          done
