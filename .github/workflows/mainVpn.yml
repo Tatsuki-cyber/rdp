@@ -1,10 +1,10 @@
-name: Tailscale VPN Exit Node
+name: Tailscale Persistent Node
 
 on:
   workflow_dispatch:
 
 jobs:
-  tailscale-vpn:
+  tailscale-node:
     runs-on: ubuntu-latest
     timeout-minutes: 60
 
@@ -12,42 +12,33 @@ jobs:
       - name: Update & Install Dependencies
         run: |
           sudo apt-get update -y
-          sudo apt-get install -y curl iptables
+          sudo apt-get install -y curl ufw
 
       - name: Install Tailscale
         run: |
           curl -fsSL https://tailscale.com/install.sh | sh
 
-      - name: Connect Tailscale with Auth Key
+      - name: Bring Up Tailscale Node
         run: |
-          # Bring up Tailscale with hostname and auth key
-          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$GITHUB_RUN_ID --advertise-exit-node
-          
-          # Wait a few seconds for IP assignment
-          sleep 5
+          if [ -z "${{ secrets.TAILSCALE_AUTH_KEY }}" ]; then
+            echo "Error: TAILSCALE_AUTH_KEY secret not set"
+            exit 1
+          fi
+          HOSTNAME="gh-node-$GITHUB_RUN_ID"
+          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=$HOSTNAME
 
-          # Verify Tailscale IP
+          # Wait for IP assignment
+          sleep 5
           TS_IP=$(tailscale ip -4)
           if [ -z "$TS_IP" ]; then
-              echo "Tailscale IP not assigned. Exiting."
-              exit 1
+            echo "Tailscale IP not assigned. Exiting."
+            exit 1
           fi
           echo "TAILSCALE_IP=$TS_IP" >> $GITHUB_ENV
 
-      - name: Enable NAT for Exit Node
+      - name: Display Node Info
         run: |
-          # Enable IP forwarding
-          sudo sysctl -w net.ipv4.ip_forward=1
-
-          # Set up NAT using iptables
-          sudo iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
-          sudo iptables -A FORWARD -i tailscale0 -o eth0 -j ACCEPT
-          sudo iptables -A FORWARD -i eth0 -o tailscale0 -m state --state ESTABLISHED,RELATED -j ACCEPT
-
-      - name: Display Tailscale Exit Node Info
-        run: |
-          echo "=== Tailscale Exit Node Active ==="
+          echo "=== Tailscale Node Active ==="
           echo "Tailscale IP: $TAILSCALE_IP"
-          echo "Hostname: gh-runner-$GITHUB_RUN_ID"
-          echo "Now you can enable this exit node on your Tailscale client"
-          echo "================================="
+          echo "Hostname: gh-node-$GITHUB_RUN_ID"
+          echo "This node is persistent but does NOT act as an exit node."
