@@ -1,0 +1,129 @@
+name: RDP - Self-Hosted Unlimited
+
+on:
+  workflow_dispatch:
+
+jobs:
+  secure-rdp:
+    # must run on a self-hosted Windows runner you control to be effectively unlimited
+    runs-on: [self-hosted, windows]
+    # do NOT set timeout-minutes here if you want it to run until cancelled
+
+    steps:
+      - name: Configure Core RDP Settings
+        shell: powershell
+        run: |
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name "fDenyTSConnections" -Value 0 -Force
+
+          # Optional: disable Network Level Authentication if your client needs it
+          # 0 = disabled, 1 = enabled
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "UserAuthentication" -Value 0 -Force
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name "SecurityLayer" -Value 0 -Force
+
+          # Firewall rule for testing (Tailscale uses its own interface, but keep this)
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null || Write-Host "no existing rule"
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
+
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User with simple password (use secrets.SIMPLE_PASSWORD)
+        shell: powershell
+        env:
+          SIMPLE_PASSWORD: ${{ secrets.SIMPLE_PASSWORD }}
+        run: |
+          # Prefer a repo secret SIMPLE_PASSWORD if set; fallback for quick test only
+          $passwordPlain = $env:SIMPLE_PASSWORD
+          if (-not $passwordPlain -or $passwordPlain -eq "") {
+              Write-Host "WARNING: SIMPLE_PASSWORD secret not set. Using fallback test password. DO NOT use in production."
+              $passwordPlain = "SimplePass123!"
+          }
+
+          $securePass = ConvertTo-SecureString $passwordPlain -AsPlainText -Force
+
+          if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
+              New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires -Description "RDP user for workflows"
+          } else {
+              Write-Host "User 'RDP' already exists — updating password."
+              $u = Get-LocalUser -Name "RDP"
+              $u | Set-LocalUser -Password $securePass
+          }
+
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP" -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction SilentlyContinue
+
+          echo "RDP_CREDS=User: RDP | Password: $passwordPlain" >> $env:GITHUB_ENV
+
+          if (-not (Get-LocalUser -Name "RDP")) {
+              Write-Error "User creation failed"
+              exit 1
+          }
+
+      - name: Install Tailscale (if not installed)
+        shell: powershell
+        run: |
+          $exe = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          if (-not (Test-Path $exe)) {
+              $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+              $installerPath = "$env:TEMP\tailscale.msi"
+              Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+              Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+              Remove-Item $installerPath -Force
+          } else {
+              Write-Host "Tailscale already installed."
+          }
+
+      - name: Establish Tailscale Connection
+        shell: powershell
+        env:
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          if (-not $env:TAILSCALE_AUTH_KEY -or $env:TAILSCALE_AUTH_KEY -eq "") {
+              Write-Error "secrets.TAILSCALE_AUTH_KEY is not set. Add it in repo settings."
+              exit 1
+          }
+          $tsExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          & $tsExe up --authkey=$env:TAILSCALE_AUTH_KEY --accept-routes --hostname=gh-runner-$env:GITHUB_RUN_ID
+
+          # Wait for ipv4
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 20) {
+              $tsIP = & $tsExe ip -4
+              Start-Sleep -Seconds 3
+              $retries++
+          }
+
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned. Exiting."
+              exit 1
+          }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+      - name: Verify RDP Accessibility
+        shell: powershell
+        run: |
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389 -WarningAction SilentlyContinue
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Warning "TCP connection to RDP port 3389 failed (may still be ok via Windows RDP client)."
+          } else {
+              Write-Host "TCP connectivity successful!"
+          }
+
+      - name: Maintain Connection (infinite loop — cancel to stop)
+        shell: powershell
+        run: |
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: RDP"
+          Write-Host "Password: $env:RDP_CREDS"
+          Write-Host "==================`n"
+
+          while ($true) {
+              Write-Host "[$(Get-Date -Format 'u')] RDP Active - cancel the workflow to stop"
+              Start-Sleep -Seconds 300
+          }
