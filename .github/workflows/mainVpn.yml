@@ -1,52 +1,103 @@
-name: Persistent Tailscale Node
+name: RDP
 
 on:
   workflow_dispatch:
 
 jobs:
-  tailscale-node:
-    runs-on: self-hosted  # Use your self-hosted runner
-    timeout-minutes: 4320 # Up to 72 hours
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 3600
 
     steps:
-      - name: Update System
+      - name: Configure Core RDP Settings
         run: |
-          sudo apt-get update -y
-          sudo apt-get upgrade -y
-          sudo apt-get install -y curl ufw
+          # Enable Remote Desktop (allow connections)
+          Set-ItemProperty -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name "fDenyTSConnections" -Value 0 -Force
+
+          # Allow inbound RDP on port 3389 (simple rule for Tailscale testing)
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" || Write-Host "no existing rule"
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389
+
+          Restart-Service -Name TermService -Force
+
+      - name: Create RDP User with simple password (use secrets if possible)
+        shell: powershell
+        run: |
+          # Use a repo secret SIMPLE_PASSWORD if available, otherwise a fallback (for testing)
+          $passwordPlain = $env:SIMPLE_PASSWORD
+          if (-not $passwordPlain -or $passwordPlain -eq "") {
+              Write-Host "WARNING: SIMPLE_PASSWORD secret not set. Using fallback test password. Do NOT use in production."
+              $passwordPlain = "SimplePass123!"
+          }
+
+          $securePass = ConvertTo-SecureString $passwordPlain -AsPlainText -Force
+
+          # Create user if not present
+          if (-not (Get-LocalUser -Name "RDP" -ErrorAction SilentlyContinue)) {
+              New-LocalUser -Name "RDP" -Password $securePass -AccountNeverExpires -Description "RDP user for workflows"
+          } else {
+              Write-Host "User 'RDP' already exists — updating password."
+              $user = Get-LocalUser -Name "RDP"
+              $user | Set-LocalUser -Password $securePass
+          }
+
+          Add-LocalGroupMember -Group "Administrators" -Member "RDP" -ErrorAction SilentlyContinue
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member "RDP" -ErrorAction SilentlyContinue
+
+          echo "RDP_CREDS=User: RDP | Password: $passwordPlain" >> $env:GITHUB_ENV
+
+          if (-not (Get-LocalUser -Name "RDP")) {
+              Write-Error "User creation failed"
+              exit 1
+          }
 
       - name: Install Tailscale
         run: |
-          curl -fsSL https://tailscale.com/install.sh | sh
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
 
-      - name: Bring Up Tailscale Node
+      - name: Establish Tailscale Connection
         run: |
-          if [ -z "${{ secrets.TAILSCALE_AUTH_KEY }}" ]; then
-            echo "Error: TAILSCALE_AUTH_KEY secret not set"
-            exit 1
-          fi
-          HOSTNAME="gh-node-$GITHUB_RUN_ID"
-          sudo tailscale up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=$HOSTNAME
+          & "$env:ProgramFiles\Tailscale\tailscale.exe" up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-runner-$env:GITHUB_RUN_ID
+          $tsIP = $null
+          $retries = 0
+          while (-not $tsIP -and $retries -lt 10) {
+              $tsIP = & "$env:ProgramFiles\Tailscale\tailscale.exe" ip -4
+              Start-Sleep -Seconds 5
+              $retries++
+          }
+          if (-not $tsIP) {
+              Write-Error "Tailscale IP not assigned. Exiting."
+              exit 1
+          }
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
 
-          # Wait a few seconds for IP assignment
-          sleep 5
-          TS_IP=$(tailscale ip -4)
-          if [ -z "$TS_IP" ]; then
-            echo "Tailscale IP not assigned. Exiting."
-            exit 1
-          fi
-          echo "TAILSCALE_IP=$TS_IP" >> $GITHUB_ENV
+      - name: Verify RDP Accessibility
+        run: |
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          $testResult = Test-NetConnection -ComputerName $env:TAILSCALE_IP -Port 3389
+          if (-not $testResult.TcpTestSucceeded) {
+              Write-Error "TCP connection to RDP port 3389 failed"
+              exit 1
+          }
+          Write-Host "TCP connectivity successful!"
 
-      - name: Display Node Info
+      - name: Maintain Connection (prints credentials)
         run: |
-          echo "=== Tailscale Node Active ==="
-          echo "Tailscale IP: $TAILSCALE_IP"
-          echo "Hostname: gh-node-$GITHUB_RUN_ID"
-          echo "This node stays connected to the tailnet but does NOT route internet traffic."
-      
-      - name: Keep Runner Alive
-        run: |
-          echo "Runner is alive. Press Ctrl+C to stop..."
-          while true; do
-            sleep 300
-          done
+          Write-Host "`n=== RDP ACCESS ==="
+          Write-Host "Address: $env:TAILSCALE_IP"
+          Write-Host "Username: RDP"
+          # RDP_CREDS was exported to GITHUB_ENV; in PowerShell use $env:RDP_CREDS
+          Write-Host "Password: $env:RDP_CREDS"
+          Write-Host "==================`n"
+
+          # Keep runner active (cancel the workflow to stop)
+          while ($true) {
+              Write-Host "[$(Get-Date)] RDP Active - Use Ctrl+C in workflow to terminate"
+              Start-Sleep -Seconds 300
+          }
